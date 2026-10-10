@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <format>
 #include <chrono>
+#include <cstdint>
+#include <unordered_set>
 
 // Program created by GUSTAW PLUTA for a uni project
 // Steganography
@@ -25,7 +27,7 @@
 // -i X:\Path\to\photo\photo.bmp
 // -i X:\Path\to\photo\photo.png
 
-auto generate_random_numbers_from_password(const std::string &password, int count) -> std::vector<int>;
+auto generate_pixel_positions(const std::string &password, std::size_t count, std::size_t pixel_count) -> std::vector<std::size_t>;
 auto embed_message_in_image(sf::Image &image, const std::string &password, const std::string &message) -> void;
 auto decode_message_from_image(const sf::Image &image, const std::string &password, int message_length) -> std::string;
 auto print_file_info(const std::string &file_path) -> void;
@@ -73,6 +75,11 @@ auto main(int argc, char *argv[]) -> int {
             return -1;
         }
 
+        if (message.size() * 8 > static_cast<std::size_t>(image.getSize().x) * image.getSize().y) {
+            fmt::print("Wiadomosc jest zbyt dluga, aby zapisac ja w podanym obrazie.\n");
+            return -1;
+        }
+
         std::string password;
         fmt::print("Wprowadz haslo: ");
         std::getline(std::cin, password);
@@ -93,11 +100,24 @@ auto main(int argc, char *argv[]) -> int {
             return -1;
         }
         std::string file_path = argv[2];
-        auto message_length = std::stoi(argv[3]);
+        int message_length = 0;
+        try {
+            message_length = std::stoi(argv[3]);
+        } catch (const std::exception &) {
+            message_length = 0;
+        }
+        if (message_length <= 0) {
+            fmt::print("Dlugosc wiadomosci musi byc dodatnia liczba calkowita.\n");
+            return -1;
+        }
 
         sf::Image image;
         if (!image.loadFromFile(file_path)) {
             fmt::print("Nie udalo sie zaladowac obrazu\n");
+            return -1;
+        }
+        if (static_cast<std::size_t>(message_length) * 8 > static_cast<std::size_t>(image.getSize().x) * image.getSize().y) {
+            fmt::print("Podana dlugosc przekracza pojemnosc obrazu.\n");
             return -1;
         }
 
@@ -125,22 +145,45 @@ auto main(int argc, char *argv[]) -> int {
     return -1;
 }
 
-auto generate_random_numbers_from_password(const std::string &password, int count) -> std::vector<int> {
-    std::hash<std::string> hash_fn;
-    size_t seed = hash_fn(password);
-    std::mt19937 generator(seed);
-    std::uniform_int_distribution<> distribution(0, std::numeric_limits<int>::max());
-    std::vector<int> random_numbers(count);
-    for (auto i = 0; i < count; ++i) {
-        random_numbers[i] = distribution(generator);
+// FNV-1a: a fixed, documented hash. std::hash is implementation-defined, so an image encoded
+// with one compiler's standard library could not be decoded with another's.
+auto fnv1a_64(const std::string &text) -> std::uint64_t {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned char c: text) {
+        hash ^= c;
+        hash *= 1099511628211ull;
     }
-    return random_numbers;
+    return hash;
+}
+
+// Returns `count` distinct pixel indices, derived only from the password.
+// Positions are drawn from a Mersenne Twister seeded with the password hash, and any index
+// that was already drawn is skipped, so no bit can overwrite another. The raw generator output
+// is used directly (not std::uniform_int_distribution, whose algorithm differs between standard
+// libraries), which keeps the sequence identical on every platform.
+// Because duplicates are skipped rather than reshuffled, the first N positions are always the
+// same no matter how many are requested, so decoding a prefix reads exactly what was written.
+auto generate_pixel_positions(const std::string &password, std::size_t count, std::size_t pixel_count) -> std::vector<std::size_t> {
+    auto hash = fnv1a_64(password);
+    std::seed_seq seed{static_cast<std::uint32_t>(hash), static_cast<std::uint32_t>(hash >> 32)};
+    std::mt19937_64 generator(seed);
+
+    std::vector<std::size_t> positions;
+    positions.reserve(count);
+    std::unordered_set<std::size_t> used;
+    while (positions.size() < count) {
+        auto pos = static_cast<std::size_t>(generator() % pixel_count);
+        if (used.insert(pos).second) {
+            positions.push_back(pos);
+        }
+    }
+    return positions;
 }
 
 auto embed_message_in_image(sf::Image &image, const std::string &password, const std::string &message) -> void {
     auto width = image.getSize().x;
     auto height = image.getSize().y;
-    auto pixel_count = width * height;
+    auto pixel_count = static_cast<std::size_t>(width) * height;
 
     std::vector<bool> binary_message;
     for (char c: message) {
@@ -150,12 +193,12 @@ auto embed_message_in_image(sf::Image &image, const std::string &password, const
         }
     }
 
-    auto random_numbers = generate_random_numbers_from_password(password, binary_message.size());
+    auto positions = generate_pixel_positions(password, binary_message.size(), pixel_count);
 
     for (size_t i = 0; i < binary_message.size(); ++i) {
-        auto pos = random_numbers[i] % pixel_count;
-        auto x = pos % width;
-        auto y = pos / width;
+        auto pos = positions[i];
+        auto x = static_cast<unsigned int>(pos % width);
+        auto y = static_cast<unsigned int>(pos / width);
         sf::Color color = image.getPixel(x, y);
         color.r = (color.r & 0xFE) | binary_message[i];
         image.setPixel(x, y, color);
@@ -165,17 +208,17 @@ auto embed_message_in_image(sf::Image &image, const std::string &password, const
 auto decode_message_from_image(const sf::Image &image, const std::string &password, int message_length) -> std::string {
     auto width = image.getSize().x;
     auto height = image.getSize().y;
-    auto pixel_count = width * height;
+    auto pixel_count = static_cast<std::size_t>(width) * height;
 
     auto num_bits = message_length * 8;
 
-    auto random_numbers = generate_random_numbers_from_password(password, num_bits);
+    auto positions = generate_pixel_positions(password, num_bits, pixel_count);
 
     std::vector<bool> binary_message(num_bits);
     for (auto i = 0; i < num_bits; ++i) {
-        auto pos = random_numbers[i] % pixel_count;
-        auto x = pos % width;
-        auto y = pos / width;
+        auto pos = positions[i];
+        auto x = static_cast<unsigned int>(pos % width);
+        auto y = static_cast<unsigned int>(pos / width);
         sf::Color color = image.getPixel(x, y);
         binary_message[i] = color.r & 1;
     }
@@ -206,7 +249,7 @@ auto print_file_info(const std::string &file_path) -> void {
     std::cout << std::format("File write time is {}\n", f_time);
 
     auto extension = path.extension().string();
-    if (extension == ".png" || extension == ".jpg") {
+    if (extension == ".png" || extension == ".bmp") {
         fmt::print("Obslugiwany format pliku: {}\n", extension);
 
         sf::Image image;
